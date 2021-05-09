@@ -70,23 +70,19 @@ Usage:
 
 eg1:
 
-```
 pool = DBConnectionPool(MYSQL_HOST, MYSQL_PORT, MYSQL_USER, MYSQL_PASSWORD, MYSQL_DB)
 conn = pool.connection()
 with conn as cursor:
     cursor.execute(sql)
-```
 
 eg2:
 
-```
 pool = DBConnectionPool(MYSQL_HOST, MYSQL_PORT, MYSQL_USER, MYSQL_PASSWORD, MYSQL_DB)
 conn = pool.connection()
 with conn:
     conn.begin()
     with conn as cursor:
         cursor.execute(sql)
-```
 
 """
 import logging
