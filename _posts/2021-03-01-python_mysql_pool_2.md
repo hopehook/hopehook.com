@@ -293,9 +293,9 @@ class DBConnectionPool(object):
 
     def _close_connection(self, c):
         """ 关闭 mysql 连接 """
-        c.close()
         with self._lock:
             self._active_count -= 1
+        c.close()
 
     def increase_drop_count(self):
         with self._lock:
