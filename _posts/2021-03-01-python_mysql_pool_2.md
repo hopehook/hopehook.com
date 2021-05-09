@@ -57,6 +57,7 @@ PyMySQL 是 python 访问 MySQL 的一个很好用的库, 可惜的是不支持�
 
 
 ```
+# coding: utf-8
 """ PyMySQL 连接池
 
 实现一个线程安全, 高效复用的连接池, 支持高并发场景.
@@ -69,20 +70,23 @@ Usage:
 
 eg1:
 
+```
 pool = DBConnectionPool(MYSQL_HOST, MYSQL_PORT, MYSQL_USER, MYSQL_PASSWORD, MYSQL_DB)
 conn = pool.connection()
 with conn as cursor:
     cursor.execute(sql)
-
+```
 
 eg2:
 
+```
 pool = DBConnectionPool(MYSQL_HOST, MYSQL_PORT, MYSQL_USER, MYSQL_PASSWORD, MYSQL_DB)
 conn = pool.connection()
 with conn:
     conn.begin()
     with conn as cursor:
         cursor.execute(sql)
+```
 
 """
 import logging
@@ -96,7 +100,7 @@ from pymysql.cursors import DictCursor
 from pymysql.connections import Connection
 
 
-__version__ = '2.0'
+__version__ = '2.1'
 
 
 class DBConnectionError(Exception):
@@ -163,6 +167,7 @@ class DBConnection(Connection):
         logging.debug("DB:__exit__: enter count: %s", self.enter_count)
         if self.enter_count != 0:
             return
+        self.pool.increase_drop_count()
         self.current_cursor.close()
         if exc_type:
             # 有异常, 无脑回滚
@@ -177,7 +182,24 @@ class DBConnection(Connection):
         del (exc_type, exc_val, exc_tb)
         # 如果中途 commit rollback 遇到网络错误, recycle 将不会执行, 避免回收到失效连接
         self.pool.recycle(self)
+        self.pool.decrease_drop_count()
 
+    # def query(self, sql, unbuffered=False):
+    #     """  sql 统一的执行方法
+    #         - cursor 的 execute execute 方法会调用 query
+    #         - 如果是非事务操作, 遇到网络错误, 尝试 ping 一下, 然后重试一次
+    #         - 如果是事务操作, 遇到网络错误, 忽略, 在最开始的 begin 会检查网络情况
+    #         - TODO: 因为 socket 超时的情况, 底层没有把错误暴露出来, 可能会有问题
+    #     """
+    #     func = super(DBConnection, self).query
+    #     try:
+    #         return func(sql, unbuffered)
+    #     except err.OperationalError as e:
+    #         if self.transaction_started == 0 and e.args[0] in (CR.CR_SERVER_LOST, CR.CR_SERVER_GONE_ERROR):
+    #             logging.warning("DB:query: Maybe lost connection to MySQL: %s, try one more time" % str(e))
+    #             self.ping()
+    #             return func(sql, unbuffered)
+    #         raise
 
     def begin(self):
         """ 事务开启
@@ -185,19 +207,27 @@ class DBConnection(Connection):
            - 如果 begin 开启事务遇到网络错误, 尝试 ping 一下, 然后重试一次
            - 如果 begin 后续的事务操作, 中途遇到网络错误, 因为会 rollback, 所以不会有问题; 即使 rollback 失败, 也得不到 commit
         """
+        func = super(DBConnection, self).begin
         # 标记为事务连接
         self.transaction_started = 1
-        super(DBConnection, self).begin()
+        try:
+            func()
+        except err.OperationalError as e:
+            if e.args[0] in (CR.CR_SERVER_LOST, CR.CR_SERVER_GONE_ERROR):
+                logging.warning("DB:reconnect_if_exc: Maybe lost connection to MySQL: %s, try one more time" % str(e))
+                self.ping()
+                func()
+            raise
 
     def commit(self):
         """ 事务提交 """
-        super(DBConnection, self).commit()
         self.transaction_started = 0
+        super(DBConnection, self).commit()
 
     def rollback(self):
         """ 事务回滚 """
-        super(DBConnection, self).rollback()
         self.transaction_started = 0
+        super(DBConnection, self).rollback()
 
     def close(self):
         """ 真实关闭 mysql 连接 """
@@ -224,6 +254,8 @@ class DBConnectionPool(object):
         :param wait_timeout: 等待连接时间, int, 单位: 秒 (默认 None 没有超时)
         :param read_timeout: DBConnection读超时, int, 单位: 秒 (默认 None 没有超时)
         :param write_timeout: DBConnection写超时, int, 单位: 秒  (默认 None 没有超时)
+
+          v2.1 版本引入 _drop_count, 记录被丢弃的连接数, 避免 _active_count 计数不对 `伪溢出` 现象
         """
         self._lock = threading.Lock()
         self._not_empty = threading.Condition(self._lock)
@@ -240,7 +272,8 @@ class DBConnectionPool(object):
         self._wait_timeout = wait_timeout
         self._read_timeout = read_timeout
         self._write_timeout = write_timeout
-        self._active_count = 0
+        self._active_count = 0        # 创建后没有回收的总连接数 (包含丢弃的连接)
+        self._drop_count = 0          # 创建后因为异常而丢弃的连接数 (等待 GC 回收)
         self._last_check_at = self.ts
 
     @property
@@ -267,6 +300,14 @@ class DBConnectionPool(object):
         c.close()
         with self._lock:
             self._active_count -= 1
+
+    def increase_drop_count(self):
+        with self._lock:
+            self._drop_count += 1
+
+    def decrease_drop_count(self):
+        with self._lock:
+            self._drop_count -= 1
 
     def _get_connection(self, block=False, timeout=None, right_side=True):
         """ 从空闲池拿 mysql 连接
@@ -299,7 +340,7 @@ class DBConnectionPool(object):
            如果连接数已经达到上限, 不在创建新的连接, 除非 _check_idle_timeout 清理掉空闲的连接, _active_count 下降
         """
         with self._lock:
-            if self._active_count >= self._max_connection:
+            if self._active_count - self._drop_count >= self._max_connection:
                 return None
             # 初始化连接实例, 并真实连上 mysql (defer_connect=False)
             conn = DBConnection(
@@ -329,8 +370,8 @@ class DBConnectionPool(object):
                 self.recycle(c)
                 break
             idle_seconds = self._last_check_at - c.idle_at
-            logging.info("DB:_check_idle_timeout: connection %s idle for %s seconds, idle count: %s, active_count: %s"
-                         % (c, idle_seconds, self._qsize(), self._active_count))
+            logging.info("DB:_check_idle_timeout: connection %s idle for %s seconds, idle count: %s, active_count: %s, drop_count: %s"
+                         % (c, idle_seconds, self._qsize(), self._active_count, self._drop_count))
             self._close_connection(c)
             c = self._get_connection(block=False, right_side=False)
 
@@ -346,7 +387,7 @@ class DBConnectionPool(object):
     def _log_connection_cost(c, started_at, pos, is_check):
         cost = time.time() * 1000 - started_at
         if cost >= 100:
-            # 耗时过长时, 需排查: 是否连接池过小 or 代码bug
+            # 耗时过长时，需排查: 是否连接池过小 or 代码bug
             logging.warning('DB:connection: pos:%s, cost:%.2fms, is_check:%s', pos, cost, is_check)
         return c
 
@@ -369,20 +410,21 @@ class DBConnectionPool(object):
         c = self._get_connection(block=True, timeout=self._wait_timeout, right_side=True)
         if c:
             return self._log_connection_cost(c, started_at, 3, is_check)
-        logging.error("DB:_new_connection: pool exceed max connection count: %s, idle count: %s, active_count: %s" %
-                      (self._max_connection, self._qsize(), self._active_count))
+        logging.error("DB:_new_connection: pool exceed max connection count: %s, idle count: %s, active_count: %s, drop_count: %s" %
+                      (self._max_connection, self._qsize(), self._active_count, self._drop_count))
         raise PoolIsFullError(err_msg="DB:connection: pool exceed max connection")
 
     def recycle(self, c):
         """ 回收连接到连接池 """
         c.idle_at = self.ts
         with self._not_empty:
-            if not self._contain(c):  # TODO：O(n)操作太耗时, 确认不会进入else分支后移除此行代码
+            if not self._contain(c):  # TODO：O(n)操作太耗时，确认不会进入else分支后移除此行代码
                 self._put(c)
                 # 唤醒等待获取连接的线程 _get_connection(block=True)
                 self._not_empty.notify()
             else:
                 logging.error('DB:recycle: unexpected error, connection:%s', c)
+
 
 ```
 
